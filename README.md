@@ -53,6 +53,14 @@ pip install redis boto3
 
 ## Index Schema
 
+The `load_index.py` script creates the index automatically. To create it manually in `valkey-cli`:
+
+```
+FT.CREATE idx:products_demo ON HASH PREFIX 1 demo: SCHEMA title TEXT description TEXT brand TAG category TAG SEPARATOR | color TAG price NUMERIC SORTABLE rating NUMERIC SORTABLE stock NUMERIC SORTABLE embedding VECTOR HNSW 6 TYPE FLOAT32 DIM 1024 DISTANCE_METRIC COSINE
+```
+
+Expanded for readability:
+
 ```
 FT.CREATE idx:products_demo
   ON HASH
@@ -70,6 +78,13 @@ FT.CREATE idx:products_demo
       TYPE FLOAT32
       DIM 1024
       DISTANCE_METRIC COSINE
+```
+
+To verify the index was created:
+
+```
+FT._LIST
+FT.INFO idx:products_demo
 ```
 
 ## Usage
