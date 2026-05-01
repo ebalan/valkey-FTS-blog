@@ -1,290 +1,113 @@
-# Valkey Vector Search Demo
+# Valkey Full-Text Search & Vector Search — Benchmark Dataset & Scripts
 
-Full-text search + vector search (KNN) demo using Amazon ElastiCache for Valkey 9.0 with synthetic e-commerce data.
-
-## Overview
-
-This project demonstrates Valkey's search capabilities:
-- **Full-text search** with prefix and fuzzy matching
-- **TAG filtering** for exact categorical matches
-- **NUMERIC range filters** for price, rating, stock
-- **Vector similarity search** (KNN) using HNSW with cosine distance
-- **Hybrid queries** combining text, tags, numerics, and vector search
-
-## Architecture
-
-```
-┌─────────────────┐     ┌──────────────────────────┐     ┌─────────────────────────┐
-│  Load Script    │────▶│  Amazon Bedrock           │────▶│  ElastiCache Valkey 9.0 │
-│  (Python)       │     │  Titan Embed Text v2      │     │  idx:products_demo      │
-│                 │     │  1024-dim embeddings      │     │  10K products           │
-└─────────────────┘     └──────────────────────────┘     └─────────────────────────┘
-```
-
-## Prerequisites
-
-- Python 3.9+
-- AWS credentials with Bedrock access
-- Network access to your ElastiCache Valkey cluster
-- Required packages: `redis`, `boto3`
-
-```bash
-pip install redis boto3
-```
+This repository contains the dataset and scripts used in the **Valkey FTS on Amazon ElastiCache** blog post.
 
 ## Dataset
 
-`data/products_synthetic_10k.json` — 10,000 synthetic e-commerce products across 10 categories:
+The dataset is based on the [Amazon ESCI (Shopping Queries)](https://github.com/amazon-science/esci-data) product catalog — **137,042 products** with rich metadata.
+
+Download from [Releases](https://github.com/ebalan/valkey-FTS-blog/releases/tag/v1.0):
+
+| File | Size | Description |
+|------|------|-------------|
+| `products_esci_vec.jsonl.gz` | 24 MB | 137K products — text, tags, numerics (no vectors) |
+| `products_esci_vec_64d.jsonl.gz` | 110 MB | 137K products — all fields + 64-dim vector embeddings |
+
+### Fields per record
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `product_id` | string | Unique identifier (PROD-00001..PROD-10000) |
-| `title` | string | Product name |
-| `description` | string | 1-3 sentence description |
-| `brand` | string | Brand name (~200 real brands) |
-| `category` | string | Pipe-separated hierarchy (e.g. "Electronics\|Headphones\|Wireless") |
-| `color` | string/null | Product color (~30% null) |
-| `price` | float | Price in USD (5.99–2999.99) |
-| `rating` | float | Customer rating (1.0–5.0) |
-| `stock` | int | Units in stock (0=out of stock, ~5% of products) |
-| `bullet_points` | string | Key features separated by " \| " |
+| `title` | TEXT | Product title (full-text indexed) |
+| `description` | TEXT | Product description |
+| `brand` | TAG | Brand name |
+| `color` | TAG | Product color |
+| `price` | NUMERIC | Price in cents |
+| `rating` | NUMERIC | Rating (0-5) |
+| `stock` | NUMERIC | Stock level (0-999) |
+| `embedding` | VECTOR | 64-dim FLOAT32 (BAAI/bge-small-en-v1.5, truncated) — only in `_64d` file |
 
-**Categories:** Electronics, Clothing, Home & Kitchen, Sports & Outdoors, Beauty, Toys & Games, Books, Automotive, Garden & Outdoor, Office Supplies (1,000 each)
+## Scripts
 
-## Index Schema
+### `load_products.py` — Load text/tag/numeric data (fast)
 
-The `load_index.py` script creates the index automatically. To create it manually in `valkey-cli`:
-
-```
-FT.CREATE idx:products_demo ON HASH PREFIX 1 demo: SCHEMA title TEXT description TEXT brand TAG category TAG SEPARATOR | color TAG price NUMERIC SORTABLE rating NUMERIC SORTABLE stock NUMERIC SORTABLE embedding VECTOR HNSW 6 TYPE FLOAT32 DIM 1024 DISTANCE_METRIC COSINE
-```
-
-Expanded for readability:
-
-```
-FT.CREATE idx:products_demo
-  ON HASH
-  PREFIX 1 demo:
-  SCHEMA
-    title TEXT
-    description TEXT
-    brand TAG
-    category TAG SEPARATOR |
-    color TAG
-    price NUMERIC SORTABLE
-    rating NUMERIC SORTABLE
-    stock NUMERIC SORTABLE
-    embedding VECTOR HNSW 6
-      TYPE FLOAT32
-      DIM 1024
-      DISTANCE_METRIC COSINE
-```
-
-To verify the index was created:
-
-```
-FT._LIST
-FT.INFO idx:products_demo
-```
-
-## Usage
-
-### 1. Load data into Valkey
-
-Edit the connection settings in `scripts/load_index.py`:
-
-```python
-VALKEY_HOST = "your-cluster-endpoint.cache.amazonaws.com"
-VALKEY_PORT = 6379
-BEDROCK_REGION = "eu-west-1"  # Region with Bedrock Titan access
-```
-
-Run:
+Bulk-loads the non-vector dataset using `valkey-cli --pipe` (RESP protocol streaming). Loads 137K products in ~2 minutes.
 
 ```bash
-python scripts/load_index.py
+# Requirements: Python 3.8+, valkey-cli in PATH
+python3 load_products.py --host your-cluster.cache.amazonaws.com
 ```
 
-This will:
-1. Create the `idx:products_demo` index
-2. Generate embeddings via Amazon Bedrock Titan Embed Text v2 (1024 dimensions)
-3. Load all 10,000 products with their embeddings (~10 minutes)
+**What it does:**
+1. Downloads the dataset from GitHub (24 MB)
+2. Creates `products_index` with TEXT, TAG, and NUMERIC fields
+3. Streams HSET commands via `valkey-cli --pipe`
 
-### 2. Run demo queries
+### `load_vectors.py` — Load with vector embeddings (fast)
+
+Bulk-loads the full dataset including 64-dim vector embeddings using `valkey-cli --pipe` with binary RESP encoding.
 
 ```bash
-python scripts/demo_queries.py
+# Requirements: Python 3.8+, valkey-cli in PATH
+# Place products_esci_vec_64d.jsonl.gz in same directory
+python3 load_vectors.py your-cluster.cache.amazonaws.com
 ```
 
-## Search Query Examples
+**What it does:**
+1. Creates `products_vec_index` with TEXT, TAG, NUMERIC, and VECTOR FLAT (COSINE, 64-dim) fields
+2. Encodes each embedding as a raw FLOAT32 binary blob (256 bytes per vector)
+3. Streams everything via `valkey-cli --pipe`
 
-### Prefix Search
+### `load_products_blog.py` — Simple Python client loader (blog snippet)
 
-Find all products with titles starting with "wire":
+A readable, blog-friendly version using the `valkey` Python client directly. Slower (~17 docs/sec) but simpler code.
 
-```
-FT.SEARCH idx:products_demo "@title:wire*" RETURN 3 title brand price LIMIT 0 5 DIALECT 2
-```
-
-Result: 124 matches (wireless, wired, etc.)
-```
-[HP] HP Notebook - Wireless              $362.60
-[Acer] Wireless Cable by Acer            $20.80
-[Apple] Apple Wireless Hub               $84.76
-[Sony] Sony Wireless Keyboard            $181.16
+```bash
+pip install valkey
+python3 load_products_blog.py
 ```
 
-### Fuzzy Search (typo tolerance)
+**What it does:**
+1. Downloads the 110 MB vector dataset from GitHub Releases
+2. Creates the index using the `valkey-py` search API
+3. Loads products using pipelined HSET with `struct.pack` for vector encoding
 
-Single edit distance — corrects "headphoens" → "headphones":
+### `query_examples.py` — All query types demonstrated
 
-```
-FT.SEARCH idx:products_demo "@title:%headphoens%" RETURN 3 title brand price LIMIT 0 5 DIALECT 2
-```
+Shows every search pattern: full-text, prefix, fuzzy, tag, numeric, combined, KNN vector, and hybrid (text + vector).
 
-Double edit distance — corrects "hedphones" → "headphones":
-
-```
-FT.SEARCH idx:products_demo "@title:%%hedphones%%" RETURN 3 title brand price LIMIT 0 5 DIALECT 2
-```
-
-Result: 65 matches
-```
-[Dell] Dell Smart Headphones             $1111.11
-[Razer] HDR Headphones by Razer          $907.51
-[Anker] 4K Headphones by Anker           $141.48
-[HyperX] HyperX Compact Headphones       $26.67
+```bash
+pip install valkey
+python3 query_examples.py --host your-cluster.cache.amazonaws.com
 ```
 
-### Text + Tag Filter
+## Performance Note
 
-Full-text search combined with brand filtering:
+| Method | Speed | Use case |
+|--------|-------|----------|
+| `valkey-cli --pipe` | ~1,100 docs/sec | Production bulk loads |
+| Python client pipeline | ~17 docs/sec | Simple scripts, small datasets |
 
+The Python client is slow because Valkey blocks on TEXT field tokenization during each pipeline batch. For large datasets, always use the RESP protocol pipe method.
+
+## Index Schemas
+
+### `products_index` (non-vector)
 ```
-FT.SEARCH idx:products_demo "@title:wireless @brand:{Sony|Bose}" RETURN 3 title brand price LIMIT 0 5 DIALECT 2
-```
-
-Result: 6 matches
-```
-[Sony] Sony Wireless Keyboard            $181.16
-[Bose] Bose Wireless Power Bank          $1030.49
-[Sony] Wireless Earbuds by Sony           $163.92
-```
-
-### Text + Numeric Range
-
-Keyboards priced between $20-$100:
-
-```
-FT.SEARCH idx:products_demo "@title:keyboard @price:[20 100]" RETURN 4 title brand price rating LIMIT 0 5 DIALECT 2
+FT.CREATE products_index ON HASH PREFIX 1 product:
+  SCHEMA title TEXT description TEXT
+  brand TAG SEPARATOR , color TAG SEPARATOR ,
+  price NUMERIC rating NUMERIC stock NUMERIC
 ```
 
-Result: 26 matches
+### `products_vec_index` (with vectors)
 ```
-[LG] LG Keyboard - Compact              $65.22  ★3.8
-[Sennheiser] Sennheiser 256GB Keyboard   $20.86  ★4.4
-[Logitech] Logitech 256GB Keyboard       $94.89  ★3.4
-[HP] HP Bluetooth Keyboard               $37.60  ★4.1
+FT.CREATE products_vec_index ON HASH PREFIX 1 pv:
+  SCHEMA title TEXT description TEXT
+  brand TAG SEPARATOR , color TAG SEPARATOR ,
+  price NUMERIC rating NUMERIC stock NUMERIC
+  embedding VECTOR FLAT 6 TYPE FLOAT32 DIM 64 DISTANCE_METRIC COSINE
 ```
-
-### Tag + Numeric (Multi-filter)
-
-Electronics between $100-$300 with rating ≥ 4.5:
-
-```
-FT.SEARCH idx:products_demo "@category:{Electronics} @price:[100 300] @rating:[4.5 5.0]" RETURN 4 title brand price rating LIMIT 0 5 DIALECT 2
-```
-
-Result: 67 matches
-```
-[HyperX] 4K Keyboard by HyperX          $160.58  ★4.5
-[Philips] Philips Monitor - Premium      $295.37  ★5.0
-[Sony] Sony Premium Earbuds              $119.55  ★4.9
-```
-
-### Full Combo (Text + Tag + Numeric)
-
-Organic beauty products, $10-$50, rating ≥ 4.0:
-
-```
-FT.SEARCH idx:products_demo "@title:organic @category:{Beauty} @price:[10 50] @rating:[4.0 5.0]" RETURN 4 title brand price rating LIMIT 0 5 DIALECT 2
-```
-
-Result: 19 matches
-```
-[OGX] OGX Organic Shampoo               $14.04  ★4.9
-[Olay] Olay Organic Hair Oil             $40.82  ★4.0
-[Garnier] Garnier Eye Cream - Organic    $43.26  ★4.6
-```
-
-### Negation
-
-Laptops NOT from Apple, $500-$1500:
-
-```
-FT.SEARCH idx:products_demo "@title:laptop -@brand:{Apple} @price:[500 1500]" RETURN 4 title brand price rating LIMIT 0 5 DIALECT 2
-```
-
-Result: 14 matches
-```
-[Philips] Philips Laptop Stand - Bluetooth  $1115.87  ★4.3
-[Samsung] Samsung Laptop Stand - Portable   $585.67   ★3.1
-[Acer] Acer Compact Laptop Stand            $569.93   ★4.0
-```
-
-### Vector Search (KNN)
-
-Semantic similarity search using embeddings:
-
-```
-FT.SEARCH idx:products_demo "*=>[KNN 5 @embedding $vec AS score]"
-  PARAMS 2 vec <embedding_bytes>
-  RETURN 4 title brand price score
-  DIALECT 2
-```
-
-Query: "premium wireless noise cancelling headphones"
-```
-0.3684  [Asus] Wireless Headphones by Asus          $69.90
-0.3872  [Samsung] Noise-Cancelling Headphones       $857.92
-0.4397  [Sony] Premium Headphones by Sony           $351.74
-0.4710  [Razer] Portable Headphones by Razer        $26.33
-```
-
-### Hybrid: Vector + Filters
-
-KNN search with pre-filtering (price and rating constraints):
-
-```
-FT.SEARCH idx:products_demo "@price:[50 150] @rating:[4.0 5.0]=>[KNN 5 @embedding $vec AS score]"
-  PARAMS 2 vec <embedding_bytes>
-  RETURN 5 title brand price rating score
-  DIALECT 2
-```
-
-Query: "lightweight running shoes for marathon"
-```
-0.6671  [The North Face] Lightweight Shorts         $144.82  ★4.1
-0.6706  [Ralph Lauren] Slim-Fit Running Shoes       $135.48  ★4.0
-0.6745  [Ralph Lauren] Slim-Fit Running Shoes       $115.04  ★4.3
-0.6763  [Levi's] Levi's Lightweight Sneakers        $113.11  ★4.6
-0.6868  [Columbia] Columbia Running Shoes - Stretch  $65.81   ★4.0
-```
-
-## Limitations & Notes
-
-- **Suffix search** (`*phones`) is NOT supported on TEXT fields — requires TAG with `WITHSUFFIXTRIE`
-- **WEIGHT clause** on TEXT fields only supports value `1.0` in ElastiCache Valkey 9.0
-- **SORTBY** is not supported in `FT.SEARCH` — KNN results are pre-sorted by score
-- Vector scores are **cosine distance** (lower = more similar, range 0–2)
-- Embeddings are generated via Amazon Bedrock Titan Embed Text v2 (1024 dimensions)
-
-## Cost Estimate
-
-- **Bedrock embeddings:** ~$0.02 per 1M input tokens (~$0.10 for 10K products)
-- **ElastiCache cache.t4g.medium:** ~$0.068/hour ($49/month)
-- **EC2 t4g.micro (loader):** ~$0.0084/hour (negligible, terminate after loading)
 
 ## License
 
-Dataset is synthetic. Code is provided as-is for demonstration purposes.
+Dataset derived from [Amazon ESCI](https://github.com/amazon-science/esci-data) under Apache 2.0.
